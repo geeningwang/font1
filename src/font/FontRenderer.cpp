@@ -5,6 +5,36 @@
 
 namespace font {
 
+namespace {
+
+struct Edge {
+    double x0 = 0.0;
+    double y0 = 0.0;
+    double x1 = 0.0;
+    double y1 = 0.0;
+    double yMin = 0.0;
+    double yMax = 0.0;
+};
+
+void AccumulateSpan(std::vector<double>& coverage, int width, int row, double left, double right, int verticalSamples)
+{
+    if (right <= 0.0 || left >= width || right <= left) return;
+
+    left = std::max(0.0, left);
+    right = std::min(static_cast<double>(width), right);
+
+    const int first = std::max(0, static_cast<int>(std::floor(left)));
+    const int last = std::min(width - 1, static_cast<int>(std::ceil(right)) - 1);
+    for (int x = first; x <= last; ++x) {
+        const double coveredWidth = std::min(right, static_cast<double>(x + 1)) - std::max(left, static_cast<double>(x));
+        if (coveredWidth > 0.0) {
+            coverage[static_cast<size_t>(row) * width + x] += coveredWidth / verticalSamples;
+        }
+    }
+}
+
+} // namespace
+
 void Image::Resize(int w, int h)
 {
     width = w;
@@ -97,8 +127,7 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
     }
 
     const double scale = pixelSize / font_.UnitsPerEm();
-    std::vector<ScreenContour> contours;
-    contours.reserve(outline.contours.size());
+    std::vector<Edge> edges;
 
     double minX = 1e9;
     double minY = 1e9;
@@ -106,17 +135,32 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
     double maxY = -1e9;
 
     for (const Contour& source : outline.contours) {
-        ScreenContour dest;
-        dest.points.reserve(source.points.size());
+        std::vector<Vec2> points;
+        points.reserve(source.points.size());
         for (const Vec2& p : source.points) {
             Vec2 screen{ p.x * scale, -p.y * scale };
             minX = std::min(minX, screen.x);
             minY = std::min(minY, screen.y);
             maxX = std::max(maxX, screen.x);
             maxY = std::max(maxY, screen.y);
-            dest.points.push_back(screen);
+            points.push_back(screen);
         }
-        contours.push_back(dest);
+
+        if (points.size() < 2) continue;
+        for (size_t i = 0, j = points.size() - 1; i < points.size(); j = i++) {
+            const Vec2& a = points[j];
+            const Vec2& b = points[i];
+            if (a.y == b.y) continue;
+
+            Edge edge;
+            edge.x0 = a.x;
+            edge.y0 = a.y;
+            edge.x1 = b.x;
+            edge.y1 = b.y;
+            edge.yMin = std::min(a.y, b.y);
+            edge.yMax = std::max(a.y, b.y);
+            edges.push_back(edge);
+        }
     }
 
     const int x0 = static_cast<int>(std::floor(minX)) - 1;
@@ -129,49 +173,45 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
     cached.height = std::max(0, y1 - y0 + 1);
     cached.alpha.assign(static_cast<size_t>(cached.width) * cached.height, 0);
 
-    constexpr int samples = 4;
-    constexpr int totalSamples = samples * samples;
-    for (int py = y0; py <= y1; ++py) {
-        for (int px = x0; px <= x1; ++px) {
-            int covered = 0;
-            for (int sy = 0; sy < samples; ++sy) {
-                for (int sx = 0; sx < samples; ++sx) {
-                    const double sampleX = px + (sx + 0.5) / samples;
-                    const double sampleY = py + (sy + 0.5) / samples;
-                    if (PointInside(contours, sampleX, sampleY)) ++covered;
+    constexpr int verticalSamples = 8;
+    std::vector<double> coverage(static_cast<size_t>(cached.width) * cached.height, 0.0);
+    std::vector<double> intersections;
+    intersections.reserve(edges.size());
+
+    for (int localY = 0; localY < cached.height; ++localY) {
+        for (int sy = 0; sy < verticalSamples; ++sy) {
+            const double sampleY = y0 + localY + (sy + 0.5) / verticalSamples;
+            intersections.clear();
+
+            for (const Edge& edge : edges) {
+                if (sampleY >= edge.yMin && sampleY < edge.yMax) {
+                    const double t = (sampleY - edge.y0) / (edge.y1 - edge.y0);
+                    intersections.push_back(edge.x0 + t * (edge.x1 - edge.x0));
                 }
             }
-            if (covered > 0) {
-                const int localX = px - x0;
-                const int localY = py - y0;
-                cached.alpha[static_cast<size_t>(localY) * cached.width + localX] =
-                    static_cast<uint8_t>(covered * 255 / totalSamples);
+
+            if (intersections.size() < 2) continue;
+            std::sort(intersections.begin(), intersections.end());
+
+            for (size_t i = 0; i + 1 < intersections.size(); i += 2) {
+                AccumulateSpan(
+                    coverage,
+                    cached.width,
+                    localY,
+                    intersections[i] - x0,
+                    intersections[i + 1] - x0,
+                    verticalSamples);
             }
         }
+    }
+
+    for (size_t i = 0; i < coverage.size(); ++i) {
+        const double alpha = std::min(1.0, std::max(0.0, coverage[i]));
+        cached.alpha[i] = static_cast<uint8_t>(std::lround(alpha * 255.0));
     }
 
     auto inserted = glyphCache_.emplace(key, std::move(cached));
     return inserted.first->second;
-}
-
-bool FontRenderer::PointInside(const std::vector<ScreenContour>& contours, double x, double y)
-{
-    bool inside = false;
-    for (const ScreenContour& contour : contours) {
-        if (contour.points.size() < 2) continue;
-        for (size_t i = 0, j = contour.points.size() - 1; i < contour.points.size(); j = i++) {
-            if (RayIntersects(contour.points[j], contour.points[i], x, y)) inside = !inside;
-        }
-    }
-    return inside;
-}
-
-bool FontRenderer::RayIntersects(const Vec2& a, const Vec2& b, double x, double y)
-{
-    const bool crosses = ((a.y > y) != (b.y > y));
-    if (!crosses) return false;
-    const double atX = (b.x - a.x) * (y - a.y) / (b.y - a.y) + a.x;
-    return x < atX;
 }
 
 } // namespace font

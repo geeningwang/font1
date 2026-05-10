@@ -36,6 +36,27 @@ void DrawRect(font::Image& image, int x0, int y0, int x1, int y1, uint32_t color
     }
 }
 
+void DrawLine(font::Image& image, double x0, double y0, double x1, double y1, uint32_t color)
+{
+    const double dx = x1 - x0;
+    const double dy = y1 - y0;
+    const int steps = std::max(1, static_cast<int>(std::ceil(std::max(std::abs(dx), std::abs(dy)))));
+    for (int i = 0; i <= steps; ++i) {
+        const double t = static_cast<double>(i) / steps;
+        const int x = static_cast<int>(std::lround(x0 + dx * t));
+        const int y = static_cast<int>(std::lround(y0 + dy * t));
+        image.BlendPixel(x, y, 220, color);
+    }
+}
+
+void DrawRectOutline(font::Image& image, double x0, double y0, double x1, double y1, uint32_t color)
+{
+    DrawLine(image, x0, y0, x1, y0, color);
+    DrawLine(image, x1, y0, x1, y1, color);
+    DrawLine(image, x1, y1, x0, y1, color);
+    DrawLine(image, x0, y1, x0, y0, color);
+}
+
 void DrawGlyphGrid(font::Image& image, const font::FontRenderer& renderer, int left, int top)
 {
     constexpr int cellW = 48;
@@ -54,6 +75,73 @@ void DrawGlyphGrid(font::Image& image, const font::FontRenderer& renderer, int l
     }
 }
 
+void DrawLargeAInspector(font::Image& image, int left, int top, int right, int bottom)
+{
+    if (right - left < 160 || bottom - top < 220) return;
+
+    constexpr uint32_t auxRed = 0xFFFF0000;
+    constexpr uint32_t ink = 0xFF111827;
+    constexpr uint32_t panel = 0xFFFCFBF7;
+
+    DrawRect(image, left, top, right, bottom, panel);
+
+    const uint16_t glyphIndex = g_font.GlyphIndexForCodepoint(L'A');
+    font::GlyphOutline outline;
+    if (!g_font.LoadGlyph(glyphIndex, outline)) return;
+
+    const int panelWidth = right - left;
+    const int panelHeight = bottom - top;
+    const double scaleByWidth = (panelWidth - 64.0) / std::max(1.0, static_cast<double>(outline.advanceWidth));
+    const double scaleByHeight = (panelHeight - 70.0) /
+        std::max(1.0, static_cast<double>(g_font.Ascender() - g_font.Descender()));
+    const double scale = std::max(0.02, std::min(scaleByWidth, scaleByHeight));
+    const double pixelSize = scale * g_font.UnitsPerEm();
+
+    const double originX = left + 32.0 - outline.leftSideBearing * scale;
+    const double baselineY = top + 42.0 + g_font.Ascender() * scale;
+    auto sx = [&](double fontX) { return originX + fontX * scale; };
+    auto sy = [&](double fontY) { return baselineY - fontY * scale; };
+
+    const double lineLeft = left + 12.0;
+    const double lineRight = right - 12.0;
+    const double ascenderY = sy(g_font.Ascender());
+    const double descenderY = sy(g_font.Descender());
+    const double baseline = sy(0.0);
+    const double emTopY = sy(g_font.UnitsPerEm());
+    const double lineGapTopY = sy(g_font.Ascender() + g_font.LineGap());
+    const double bboxTop = sy(outline.yMax);
+    const double bboxBottom = sy(outline.yMin);
+
+    // Horizontal metrics and guide lines.
+    DrawLine(image, lineLeft, baseline, lineRight, baseline, auxRed);
+    DrawLine(image, lineLeft, ascenderY, lineRight, ascenderY, auxRed);
+    DrawLine(image, lineLeft, descenderY, lineRight, descenderY, auxRed);
+    DrawLine(image, lineLeft, emTopY, lineRight, emTopY, auxRed);
+    DrawLine(image, lineLeft, lineGapTopY, lineRight, lineGapTopY, auxRed);
+    DrawLine(image, lineLeft, bboxTop, lineRight, bboxTop, auxRed);
+    DrawLine(image, lineLeft, bboxBottom, lineRight, bboxBottom, auxRed);
+
+    // Vertical metrics: origin, left side bearing, black box, and advance.
+    DrawLine(image, sx(0.0), top + 12.0, sx(0.0), bottom - 12.0, auxRed);
+    DrawLine(image, sx(outline.leftSideBearing), top + 12.0, sx(outline.leftSideBearing), bottom - 12.0, auxRed);
+    DrawLine(image, sx(outline.xMin), top + 12.0, sx(outline.xMin), bottom - 12.0, auxRed);
+    DrawLine(image, sx(outline.xMax), top + 12.0, sx(outline.xMax), bottom - 12.0, auxRed);
+    DrawLine(image, sx(outline.advanceWidth), top + 12.0, sx(outline.advanceWidth), bottom - 12.0, auxRed);
+
+    DrawRectOutline(image, sx(outline.xMin), sy(outline.yMax), sx(outline.xMax), sy(outline.yMin), auxRed);
+    DrawRectOutline(image, sx(0.0), sy(g_font.UnitsPerEm()), sx(g_font.UnitsPerEm()), sy(0.0), auxRed);
+
+    g_renderer->DrawGlyph(image, glyphIndex, originX, baselineY, pixelSize, ink);
+
+    // Draw the flattened outline geometry over the filled glyph.
+    for (const font::Contour& contour : outline.contours) {
+        if (contour.points.size() < 2) continue;
+        for (size_t i = 0, j = contour.points.size() - 1; i < contour.points.size(); j = i++) {
+            DrawLine(image, sx(contour.points[j].x), sy(contour.points[j].y), sx(contour.points[i].x), sy(contour.points[i].y), auxRed);
+        }
+    }
+}
+
 void RenderContent(int width, int height)
 {
     g_image.Resize(width, height);
@@ -66,6 +154,9 @@ void RenderContent(int width, int height)
     g_renderer->DrawString(g_image, L"The quick brown fox jumps over the lazy dog.", 48.0, 230.0, 42.0, 0xFF111827);
     g_renderer->DrawString(g_image, L"0123456789  !?&$%@#  ABC xyz", 48.0, 290.0, 38.0, 0xFF1F2630);
     DrawGlyphGrid(g_image, *g_renderer, 48, 340);
+
+    const int inspectorLeft = std::max(650, width - 430);
+    DrawLargeAInspector(g_image, inspectorLeft, 24, width - 24, height - 24);
 }
 
 void RenderScene(HWND hwnd)

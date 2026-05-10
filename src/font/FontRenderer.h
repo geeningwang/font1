@@ -27,10 +27,6 @@ public:
     void DrawGlyph(Image& image, uint16_t glyphIndex, double x, double baselineY, double pixelSize, uint32_t bgra) const;
 
 private:
-    struct ScreenContour {
-        std::vector<Vec2> points;
-    };
-
     struct CachedGlyph {
         int width = 0;
         int height = 0;
@@ -58,8 +54,6 @@ private:
     };
 
     const CachedGlyph& RasterizeGlyph(uint16_t glyphIndex, double pixelSize) const;
-    static bool PointInside(const std::vector<ScreenContour>& contours, double x, double y);
-    static bool RayIntersects(const Vec2& a, const Vec2& b, double x, double y);
 
     const TtfFont& font_;
     mutable std::unordered_map<CacheKey, CachedGlyph, CacheKeyHash> glyphCache_;
