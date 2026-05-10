@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <fstream>
+#include <numeric>
 
 namespace font {
 
@@ -37,12 +38,18 @@ bool TtfFont::LoadFromFile(const std::wstring& path, std::wstring* error)
 
     tables_.clear();
     cmap_.clear();
+    ligaturesByFirst_.clear();
+    kernPairs_.clear();
+    gposPairs_.clear();
     familyName_.clear();
 
     if (!ParseTables(error)) return false;
     if (!ParseRequiredTables(error)) return false;
     if (!ParseCmap(error)) return false;
     ParseName();
+    ParseKern();
+    ParseGsub();
+    ParseGpos();
     return true;
 }
 
@@ -206,6 +213,254 @@ uint16_t TtfFont::GlyphIndexForCodepoint(uint32_t codepoint) const
 {
     auto it = cmap_.find(codepoint);
     return it == cmap_.end() ? 0 : it->second;
+}
+
+std::vector<PositionedGlyph> TtfFont::ShapeText(const std::wstring& text) const
+{
+    std::vector<uint16_t> input;
+    input.reserve(text.size());
+    for (wchar_t ch : text) input.push_back(GlyphIndexForCodepoint(static_cast<uint32_t>(ch)));
+
+    std::vector<uint16_t> glyphs;
+    for (size_t i = 0; i < input.size();) {
+        const uint16_t first = input[i];
+        const auto found = ligaturesByFirst_.find(first);
+        const LigatureSubstitution* best = nullptr;
+        if (found != ligaturesByFirst_.end()) {
+            for (const LigatureSubstitution& ligature : found->second) {
+                if (i + ligature.components.size() > input.size()) continue;
+                bool match = true;
+                for (size_t j = 0; j < ligature.components.size(); ++j) {
+                    if (input[i + j] != ligature.components[j]) {
+                        match = false;
+                        break;
+                    }
+                }
+                if (match && (!best || ligature.components.size() > best->components.size())) best = &ligature;
+            }
+        }
+
+        if (best) {
+            glyphs.push_back(best->ligatureGlyph);
+            i += best->components.size();
+        } else {
+            glyphs.push_back(first);
+            ++i;
+        }
+    }
+
+    std::vector<PositionedGlyph> shaped;
+    shaped.reserve(glyphs.size());
+    for (uint16_t glyph : glyphs) {
+        PositionedGlyph positioned;
+        positioned.glyphIndex = glyph;
+        positioned.xAdvance = static_cast<int16_t>(GlyphAdvanceWidth(glyph));
+        shaped.push_back(positioned);
+    }
+
+    for (size_t i = 0; i + 1 < shaped.size(); ++i) {
+        shaped[i].xAdvance = static_cast<int16_t>(shaped[i].xAdvance + PairAdjustment(shaped[i].glyphIndex, shaped[i + 1].glyphIndex));
+    }
+
+    return shaped;
+}
+
+void TtfFont::ParseKern()
+{
+    const Table* kern = FindTable("kern");
+    if (!kern || kern->length < 4) return;
+
+    const uint32_t base = kern->offset;
+    const uint16_t nTables = U16(base + 2);
+    uint32_t subtable = base + 4;
+    for (uint16_t i = 0; i < nTables && HasBytes(subtable, 6); ++i) {
+        const uint16_t length = U16(subtable + 2);
+        const uint16_t coverage = U16(subtable + 4);
+        const uint16_t format = coverage >> 8;
+        if (length < 6 || !HasBytes(subtable, length)) break;
+
+        if (format == 0 && length >= 14) {
+            const uint16_t nPairs = U16(subtable + 6);
+            uint32_t p = subtable + 14;
+            for (uint16_t pair = 0; pair < nPairs && HasBytes(p, 6); ++pair) {
+                const uint16_t left = U16(p);
+                const uint16_t right = U16(p + 2);
+                const int16_t value = I16(p + 4);
+                kernPairs_[(static_cast<uint32_t>(left) << 16) | right] = value;
+                p += 6;
+            }
+        }
+        subtable += length;
+    }
+}
+
+void TtfFont::ParseGsub()
+{
+    const Table* gsub = FindTable("GSUB");
+    if (!gsub || gsub->length < 10) return;
+
+    const uint32_t base = gsub->offset;
+    const uint16_t lookupListOffset = U16(base + 8);
+    const uint32_t lookupList = base + lookupListOffset;
+    if (!HasBytes(lookupList, 2)) return;
+
+    const uint16_t lookupCount = U16(lookupList);
+    for (uint16_t i = 0; i < lookupCount; ++i) {
+        const uint32_t lookupOffsetPos = lookupList + 2 + i * 2;
+        if (!HasBytes(lookupOffsetPos, 2)) return;
+        const uint32_t lookup = lookupList + U16(lookupOffsetPos);
+        if (!HasBytes(lookup, 6)) continue;
+
+        const uint16_t subtableCount = U16(lookup + 4);
+        const uint16_t lookupType = U16(lookup);
+        for (uint16_t sub = 0; sub < subtableCount; ++sub) {
+            const uint32_t subOffsetPos = lookup + 6 + sub * 2;
+            if (!HasBytes(subOffsetPos, 2)) break;
+            const uint32_t subtable = lookup + U16(subOffsetPos);
+            if (lookupType == 4) {
+                ParseGsubLigatureSubtable(subtable);
+            } else if (lookupType == 7 && HasBytes(subtable, 8) && U16(subtable) == 1) {
+                const uint16_t extensionLookupType = U16(subtable + 2);
+                const uint32_t extensionOffset = U32(subtable + 4);
+                if (extensionLookupType == 4) ParseGsubLigatureSubtable(subtable + extensionOffset);
+            }
+        }
+    }
+
+    for (auto& item : ligaturesByFirst_) {
+        std::sort(item.second.begin(), item.second.end(), [](const LigatureSubstitution& a, const LigatureSubstitution& b) {
+            return a.components.size() > b.components.size();
+        });
+    }
+}
+
+void TtfFont::ParseGsubLigatureSubtable(uint32_t subtable)
+{
+    if (!HasBytes(subtable, 6) || U16(subtable) != 1) return;
+
+    const std::vector<uint16_t> coverage = ReadCoverage(subtable + U16(subtable + 2));
+    const uint16_t ligatureSetCount = U16(subtable + 4);
+    const uint16_t count = std::min<uint16_t>(ligatureSetCount, static_cast<uint16_t>(coverage.size()));
+
+    for (uint16_t i = 0; i < count; ++i) {
+        const uint32_t setOffsetPos = subtable + 6 + i * 2;
+        if (!HasBytes(setOffsetPos, 2)) break;
+        const uint32_t set = subtable + U16(setOffsetPos);
+        if (!HasBytes(set, 2)) continue;
+
+        const uint16_t ligatureCount = U16(set);
+        for (uint16_t lig = 0; lig < ligatureCount; ++lig) {
+            const uint32_t ligOffsetPos = set + 2 + lig * 2;
+            if (!HasBytes(ligOffsetPos, 2)) break;
+            const uint32_t record = set + U16(ligOffsetPos);
+            if (!HasBytes(record, 4)) continue;
+
+            const uint16_t ligatureGlyph = U16(record);
+            const uint16_t componentCount = U16(record + 2);
+            if (componentCount < 2 || !HasBytes(record + 4, static_cast<uint32_t>(componentCount - 1) * 2)) continue;
+
+            LigatureSubstitution subst;
+            subst.ligatureGlyph = ligatureGlyph;
+            subst.components.push_back(coverage[i]);
+            for (uint16_t component = 1; component < componentCount; ++component) {
+                subst.components.push_back(U16(record + 4 + (component - 1) * 2));
+            }
+            ligaturesByFirst_[coverage[i]].push_back(std::move(subst));
+        }
+    }
+}
+
+void TtfFont::ParseGpos()
+{
+    const Table* gpos = FindTable("GPOS");
+    if (!gpos || gpos->length < 10) return;
+
+    const uint32_t base = gpos->offset;
+    const uint16_t lookupListOffset = U16(base + 8);
+    const uint32_t lookupList = base + lookupListOffset;
+    if (!HasBytes(lookupList, 2)) return;
+
+    const uint16_t lookupCount = U16(lookupList);
+    for (uint16_t i = 0; i < lookupCount; ++i) {
+        const uint32_t lookupOffsetPos = lookupList + 2 + i * 2;
+        if (!HasBytes(lookupOffsetPos, 2)) return;
+        const uint32_t lookup = lookupList + U16(lookupOffsetPos);
+        if (!HasBytes(lookup, 6)) continue;
+
+        const uint16_t subtableCount = U16(lookup + 4);
+        const uint16_t lookupType = U16(lookup);
+        for (uint16_t sub = 0; sub < subtableCount; ++sub) {
+            const uint32_t subOffsetPos = lookup + 6 + sub * 2;
+            if (!HasBytes(subOffsetPos, 2)) break;
+            const uint32_t subtable = lookup + U16(subOffsetPos);
+            if (lookupType == 2) {
+                ParseGposPairSubtable(subtable);
+            } else if (lookupType == 9 && HasBytes(subtable, 8) && U16(subtable) == 1) {
+                const uint16_t extensionLookupType = U16(subtable + 2);
+                const uint32_t extensionOffset = U32(subtable + 4);
+                if (extensionLookupType == 2) ParseGposPairSubtable(subtable + extensionOffset);
+            }
+        }
+    }
+}
+
+void TtfFont::ParseGposPairSubtable(uint32_t subtable)
+{
+    if (!HasBytes(subtable, 10)) return;
+
+    const uint16_t posFormat = U16(subtable);
+    const std::vector<uint16_t> coverage = ReadCoverage(subtable + U16(subtable + 2));
+    const uint16_t valueFormat1 = U16(subtable + 4);
+    const uint16_t valueFormat2 = U16(subtable + 6);
+    const uint32_t valueSize1 = ValueRecordSize(valueFormat1);
+    const uint32_t valueSize2 = ValueRecordSize(valueFormat2);
+
+    if (posFormat == 1) {
+        const uint16_t pairSetCount = U16(subtable + 8);
+        const uint16_t count = std::min<uint16_t>(pairSetCount, static_cast<uint16_t>(coverage.size()));
+        for (uint16_t i = 0; i < count; ++i) {
+            const uint32_t pairSetOffsetPos = subtable + 10 + i * 2;
+            if (!HasBytes(pairSetOffsetPos, 2)) break;
+            const uint32_t pairSet = subtable + U16(pairSetOffsetPos);
+            if (!HasBytes(pairSet, 2)) continue;
+
+            const uint16_t pairValueCount = U16(pairSet);
+            uint32_t p = pairSet + 2;
+            for (uint16_t pair = 0; pair < pairValueCount && HasBytes(p, 2 + valueSize1 + valueSize2); ++pair) {
+                const uint16_t second = U16(p);
+                const int16_t adjust = ReadXAdvanceFromValueRecord(p + 2, valueFormat1);
+                if (adjust != 0) gposPairs_[(static_cast<uint32_t>(coverage[i]) << 16) | second] = adjust;
+                p += 2 + valueSize1 + valueSize2;
+            }
+        }
+    } else if (posFormat == 2 && HasBytes(subtable, 16)) {
+        const std::vector<uint16_t> classDef1 = ReadClassDef(subtable + U16(subtable + 8));
+        const std::vector<uint16_t> classDef2 = ReadClassDef(subtable + U16(subtable + 10));
+        const uint16_t class1Count = U16(subtable + 12);
+        const uint16_t class2Count = U16(subtable + 14);
+        const uint32_t recordSize = valueSize1 + valueSize2;
+        const uint32_t records = subtable + 16;
+        if (recordSize == 0 || !HasBytes(records, static_cast<uint32_t>(class1Count) * class2Count * recordSize)) return;
+
+        std::vector<std::vector<uint16_t>> glyphsByClass2(class2Count);
+        for (uint16_t glyph = 0; glyph < numGlyphs_; ++glyph) {
+            const uint16_t cls = glyph < classDef2.size() ? classDef2[glyph] : 0;
+            if (cls < class2Count) glyphsByClass2[cls].push_back(glyph);
+        }
+
+        for (uint16_t first : coverage) {
+            const uint16_t class1 = first < classDef1.size() ? classDef1[first] : 0;
+            if (class1 >= class1Count) continue;
+            for (uint16_t class2 = 0; class2 < class2Count; ++class2) {
+                const uint32_t record = records + (static_cast<uint32_t>(class1) * class2Count + class2) * recordSize;
+                const int16_t adjust = ReadXAdvanceFromValueRecord(record, valueFormat1);
+                if (adjust == 0) continue;
+                for (uint16_t second : glyphsByClass2[class2]) {
+                    gposPairs_[(static_cast<uint32_t>(first) << 16) | second] = adjust;
+                }
+            }
+        }
+    }
 }
 
 bool TtfFont::LoadGlyph(uint16_t glyphIndex, GlyphOutline& outline, int depth) const
@@ -449,6 +704,95 @@ const TtfFont::Table* TtfFont::FindTable(const char tag[5]) const
 {
     auto it = tables_.find(std::string(tag, 4));
     return it == tables_.end() ? nullptr : &it->second;
+}
+
+std::vector<uint16_t> TtfFont::ReadCoverage(uint32_t offset) const
+{
+    std::vector<uint16_t> glyphs;
+    if (!HasBytes(offset, 4)) return glyphs;
+
+    const uint16_t format = U16(offset);
+    if (format == 1) {
+        const uint16_t count = U16(offset + 2);
+        if (!HasBytes(offset + 4, static_cast<uint32_t>(count) * 2)) return glyphs;
+        glyphs.reserve(count);
+        for (uint16_t i = 0; i < count; ++i) glyphs.push_back(U16(offset + 4 + i * 2));
+    } else if (format == 2) {
+        const uint16_t rangeCount = U16(offset + 2);
+        if (!HasBytes(offset + 4, static_cast<uint32_t>(rangeCount) * 6)) return glyphs;
+        for (uint16_t i = 0; i < rangeCount; ++i) {
+            const uint32_t record = offset + 4 + i * 6;
+            const uint16_t start = U16(record);
+            const uint16_t end = U16(record + 2);
+            for (uint32_t glyph = start; glyph <= end && glyph <= 0xFFFF; ++glyph) {
+                glyphs.push_back(static_cast<uint16_t>(glyph));
+            }
+        }
+    }
+    return glyphs;
+}
+
+std::vector<uint16_t> TtfFont::ReadClassDef(uint32_t offset) const
+{
+    std::vector<uint16_t> classes(numGlyphs_, 0);
+    if (!HasBytes(offset, 4)) return classes;
+
+    const uint16_t format = U16(offset);
+    if (format == 1) {
+        const uint16_t startGlyph = U16(offset + 2);
+        const uint16_t glyphCount = U16(offset + 4);
+        if (!HasBytes(offset + 6, static_cast<uint32_t>(glyphCount) * 2)) return classes;
+        for (uint16_t i = 0; i < glyphCount; ++i) {
+            const uint32_t glyph = startGlyph + i;
+            if (glyph < classes.size()) classes[glyph] = U16(offset + 6 + i * 2);
+        }
+    } else if (format == 2) {
+        const uint16_t rangeCount = U16(offset + 2);
+        if (!HasBytes(offset + 4, static_cast<uint32_t>(rangeCount) * 6)) return classes;
+        for (uint16_t i = 0; i < rangeCount; ++i) {
+            const uint32_t record = offset + 4 + i * 6;
+            const uint16_t start = U16(record);
+            const uint16_t end = U16(record + 2);
+            const uint16_t cls = U16(record + 4);
+            for (uint32_t glyph = start; glyph <= end && glyph < classes.size(); ++glyph) classes[glyph] = cls;
+        }
+    }
+    return classes;
+}
+
+uint32_t TtfFont::ValueRecordSize(uint16_t valueFormat) const
+{
+    uint32_t size = 0;
+    for (uint16_t bit = 0; bit < 8; ++bit) {
+        if (valueFormat & (1u << bit)) size += 2;
+    }
+    return size;
+}
+
+int16_t TtfFont::ReadXAdvanceFromValueRecord(uint32_t offset, uint16_t valueFormat) const
+{
+    uint32_t p = offset;
+    if (valueFormat & 0x0001) p += 2; // xPlacement
+    if (valueFormat & 0x0002) p += 2; // yPlacement
+    if (valueFormat & 0x0004) return I16(p);
+    return 0;
+}
+
+uint16_t TtfFont::GlyphAdvanceWidth(uint16_t glyphIndex) const
+{
+    const Table* hmtx = FindTable("hmtx");
+    if (!hmtx || numHMetrics_ == 0) return 0;
+    if (glyphIndex < numHMetrics_) return U16(hmtx->offset + glyphIndex * 4);
+    return U16(hmtx->offset + (numHMetrics_ - 1) * 4);
+}
+
+int16_t TtfFont::PairAdjustment(uint16_t leftGlyph, uint16_t rightGlyph) const
+{
+    const uint32_t key = (static_cast<uint32_t>(leftGlyph) << 16) | rightGlyph;
+    auto gpos = gposPairs_.find(key);
+    if (gpos != gposPairs_.end()) return gpos->second;
+    auto kern = kernPairs_.find(key);
+    return kern != kernPairs_.end() ? kern->second : 0;
 }
 
 uint32_t TtfFont::GlyphOffset(uint16_t glyphIndex) const

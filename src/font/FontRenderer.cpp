@@ -77,18 +77,27 @@ void FontRenderer::DrawString(Image& image, const std::wstring& text, double x, 
 {
     const double scale = pixelSize / font_.UnitsPerEm();
     double penX = x;
+    std::wstring line;
 
     for (wchar_t ch : text) {
         if (ch == L'\n') {
+            const std::vector<PositionedGlyph> glyphs = font_.ShapeText(line);
+            for (const PositionedGlyph& glyph : glyphs) {
+                DrawGlyph(image, glyph.glyphIndex, penX + glyph.xOffset * scale, baselineY - glyph.yOffset * scale, pixelSize, bgra);
+                penX += glyph.xAdvance * scale;
+            }
+            line.clear();
             penX = x;
             baselineY += (font_.Ascender() - font_.Descender() + font_.LineGap()) * scale;
             continue;
         }
+        line.push_back(ch);
+    }
 
-        const uint16_t glyphIndex = font_.GlyphIndexForCodepoint(static_cast<uint32_t>(ch));
-        const CachedGlyph& glyph = RasterizeGlyph(glyphIndex, pixelSize);
-        DrawGlyph(image, glyphIndex, penX, baselineY, pixelSize, bgra);
-        penX += glyph.advanceWidth * scale;
+    const std::vector<PositionedGlyph> glyphs = font_.ShapeText(line);
+    for (const PositionedGlyph& glyph : glyphs) {
+        DrawGlyph(image, glyph.glyphIndex, penX + glyph.xOffset * scale, baselineY - glyph.yOffset * scale, pixelSize, bgra);
+        penX += glyph.xAdvance * scale;
     }
 }
 
