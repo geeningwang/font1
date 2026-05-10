@@ -1,26 +1,59 @@
 #define NOMINMAX
 #include <windows.h>
 #include <windowsx.h>
+#include <shobjidl.h>
 
 #include "font/FontRenderer.h"
 #include "font/TtfFont.h"
 
 #include <algorithm>
 #include <cmath>
+#include <cwctype>
 #include <fstream>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
 
 constexpr wchar_t kWindowClass[] = L"Font1WindowClass";
 constexpr wchar_t kFontPath[] = L"C:\\Windows\\Fonts\\times.ttf";
+constexpr wchar_t kDefaultFontDirectory[] = L"C:\\Windows\\Fonts";
+constexpr uint32_t kBlankBackground = 0xFFFFFFFF;
+constexpr int kSidebarWidth = 280;
+constexpr int kFontCategoryId = 1999;
+constexpr int kFontDirectoryLabelId = 2000;
+constexpr int kFontListId = 2001;
+constexpr int kFontPathId = 2002;
+constexpr int kFontOpenId = 2003;
+
+enum class FontCategory {
+    Ttf,
+    Ttc,
+    Otf,
+    Fon,
+    Fnt
+};
+
+struct FontFileItem {
+    std::wstring name;
+    std::wstring path;
+};
 
 font::TtfFont g_font;
 std::unique_ptr<font::FontRenderer> g_renderer;
 font::Image g_image;
-std::wstring g_status = L"Loading...";
+std::wstring g_status;
+std::wstring g_fontPath;
+std::wstring g_fontDirectory = kDefaultFontDirectory;
+HWND g_fontCategoryCombo = nullptr;
+HWND g_fontDirectoryLabel = nullptr;
+HWND g_fontList = nullptr;
+HWND g_fontPathEdit = nullptr;
+HWND g_fontOpenButton = nullptr;
+std::vector<FontFileItem> g_fontFiles;
+FontCategory g_fontCategory = FontCategory::Ttf;
 bool g_inSizeMove = false;
 bool g_trackingMouse = false;
 
@@ -329,7 +362,8 @@ void RenderContent(int width, int height)
     g_image.Clear(0xFFE7E2D8);
 
     DrawRect(g_image, 24, 24, width - 24, 158, 0xFFF8F7F2);
-    g_renderer->DrawString(g_image, L"Times New Roman", 48.0, 91.0, 54.0, 0xFF111827);
+    const std::wstring familyName = g_font.FamilyName().empty() ? L"Selected Font" : g_font.FamilyName();
+    g_renderer->DrawString(g_image, familyName, 48.0, 91.0, 54.0, 0xFF111827);
     g_renderer->DrawString(g_image, L"Custom TrueType parser + software rasterizer", 50.0, 132.0, 20.0, 0xFF46515F);
 
     g_renderer->DrawString(g_image, L"The quick brown fox jumps over the lazy dog.", 48.0, 230.0, 42.0, 0xFF111827);
@@ -341,30 +375,242 @@ void RenderContent(int width, int height)
     DrawTooltip(g_image);
 }
 
+void RenderBlank(HWND hwnd)
+{
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const int width = std::max(1, static_cast<int>(rc.right - rc.left) - kSidebarWidth);
+    const int height = std::max(1, static_cast<int>(rc.bottom - rc.top));
+    g_image.Resize(width, height);
+    g_image.Clear(kBlankBackground);
+    SetWindowTextW(hwnd, L"font1");
+}
+
 void RenderScene(HWND hwnd)
 {
     RECT rc{};
     GetClientRect(hwnd, &rc);
-    const int width = std::max(1, static_cast<int>(rc.right - rc.left));
+    const int width = std::max(1, static_cast<int>(rc.right - rc.left) - kSidebarWidth);
     const int height = std::max(1, static_cast<int>(rc.bottom - rc.top));
+
+    if (!g_renderer) {
+        RenderBlank(hwnd);
+        return;
+    }
+
     RenderContent(width, height);
     std::wstring title = L"font1 - ";
     title += g_status;
     SetWindowTextW(hwnd, title.c_str());
 }
 
-bool LoadFont(HWND hwnd)
+std::wstring FileNameFromPath(const std::wstring& path)
 {
+    const size_t slash = path.find_last_of(L"\\/");
+    return slash == std::wstring::npos ? path : path.substr(slash + 1);
+}
+
+std::wstring Lowercase(std::wstring value)
+{
+    for (wchar_t& ch : value) ch = static_cast<wchar_t>(std::towlower(ch));
+    return value;
+}
+
+bool IsFontFileName(const std::wstring& name)
+{
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+
+    const std::wstring ext = Lowercase(name.substr(dot));
+    return ext == L".ttf" || ext == L".ttc" || ext == L".otf" || ext == L".fon" || ext == L".fnt";
+}
+
+bool MatchesFontCategory(const std::wstring& name, FontCategory category)
+{
+    const size_t dot = name.find_last_of(L'.');
+    if (dot == std::wstring::npos) return false;
+
+    const std::wstring ext = Lowercase(name.substr(dot));
+    switch (category) {
+    case FontCategory::Ttf:
+        return ext == L".ttf";
+    case FontCategory::Ttc:
+        return ext == L".ttc";
+    case FontCategory::Otf:
+        return ext == L".otf";
+    case FontCategory::Fon:
+        return ext == L".fon";
+    case FontCategory::Fnt:
+        return ext == L".fnt";
+    default:
+        return false;
+    }
+}
+
+std::vector<FontFileItem> EnumerateFontFiles(const std::wstring& directory)
+{
+    std::vector<FontFileItem> files;
+    const std::wstring pattern = directory + L"\\*";
+
+    WIN32_FIND_DATAW data{};
+    HANDLE find = FindFirstFileW(pattern.c_str(), &data);
+    if (find == INVALID_HANDLE_VALUE) return files;
+
+    do {
+        if ((data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) continue;
+        const std::wstring name = data.cFileName;
+        if (!IsFontFileName(name)) continue;
+        if (!MatchesFontCategory(name, g_fontCategory)) continue;
+        files.push_back({ name, directory + L"\\" + name });
+    } while (FindNextFileW(find, &data));
+
+    FindClose(find);
+
+    std::sort(files.begin(), files.end(), [](const FontFileItem& a, const FontFileItem& b) {
+        return Lowercase(a.name) < Lowercase(b.name);
+    });
+    return files;
+}
+
+void LayoutMainWindow(HWND hwnd)
+{
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    const int height = rc.bottom - rc.top;
+    constexpr int pad = 10;
+    constexpr int categoryH = 28;
+    constexpr int comboDropH = 150;
+    constexpr int labelH = 20;
+    constexpr int pathH = 24;
+    constexpr int buttonH = 28;
+
+    if (g_fontDirectoryLabel) {
+        MoveWindow(g_fontDirectoryLabel, pad, pad, kSidebarWidth - pad * 2, labelH, TRUE);
+    }
+    if (g_fontCategoryCombo) {
+        MoveWindow(g_fontCategoryCombo, pad, pad + labelH + 8, kSidebarWidth - pad * 2, comboDropH, TRUE);
+    }
+    if (g_fontList) {
+        const int listTop = pad + labelH + 8 + categoryH + 6;
+        const int listH = std::max(40, height - listTop - pad * 3 - pathH - buttonH);
+        MoveWindow(g_fontList, pad, listTop, kSidebarWidth - pad * 2, listH, TRUE);
+    }
+    if (g_fontPathEdit) {
+        MoveWindow(g_fontPathEdit, pad, height - pad * 2 - buttonH - pathH, kSidebarWidth - pad * 2, pathH, TRUE);
+    }
+    if (g_fontOpenButton) {
+        MoveWindow(g_fontOpenButton, pad, height - pad - buttonH, kSidebarWidth - pad * 2, buttonH, TRUE);
+    }
+}
+
+void UpdateSelectedFontPath();
+
+void PopulateFontList()
+{
+    if (!g_fontList) return;
+
+    SendMessageW(g_fontList, LB_RESETCONTENT, 0, 0);
+    if (g_fontPathEdit) SetWindowTextW(g_fontPathEdit, L"");
+    if (g_fontDirectoryLabel) SetWindowTextW(g_fontDirectoryLabel, g_fontDirectory.c_str());
+    g_fontFiles = EnumerateFontFiles(g_fontDirectory);
+
+    for (const FontFileItem& file : g_fontFiles) {
+        SendMessageW(g_fontList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(file.name.c_str()));
+    }
+
+    if (g_fontFiles.empty()) {
+        SendMessageW(g_fontList, LB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"No font files found."));
+        EnableWindow(g_fontList, FALSE);
+        if (g_fontOpenButton) EnableWindow(g_fontOpenButton, FALSE);
+    } else {
+        EnableWindow(g_fontList, TRUE);
+        if (g_fontOpenButton) EnableWindow(g_fontOpenButton, TRUE);
+        SendMessageW(g_fontList, LB_SETCURSEL, 0, 0);
+        UpdateSelectedFontPath();
+    }
+}
+
+void UpdateSelectedFontPath()
+{
+    if (!g_fontList || !g_fontPathEdit) return;
+
+    const int selected = static_cast<int>(SendMessageW(g_fontList, LB_GETCURSEL, 0, 0));
+    if (selected == LB_ERR || selected >= static_cast<int>(g_fontFiles.size())) {
+        SetWindowTextW(g_fontPathEdit, L"");
+        return;
+    }
+
+    SetWindowTextW(g_fontPathEdit, g_fontFiles[static_cast<size_t>(selected)].path.c_str());
+}
+
+bool LoadFont(HWND hwnd, const std::wstring& path)
+{
+    font::TtfFont nextFont;
     std::wstring error;
-    if (!g_font.LoadFromFile(kFontPath, &error)) {
-        g_status = L"failed to load C:\\Windows\\Fonts\\times.ttf: " + error;
+    if (!nextFont.LoadFromFile(path, &error)) {
+        g_status = L"failed to load " + path + L": " + error;
         MessageBoxW(hwnd, g_status.c_str(), L"font1", MB_ICONERROR | MB_OK);
         return false;
     }
 
-    g_status = L"loaded C:\\Windows\\Fonts\\times.ttf";
+    g_font = std::move(nextFont);
+    g_fontPath = path;
+    g_status = L"loaded " + FileNameFromPath(path);
     g_renderer = std::make_unique<font::FontRenderer>(g_font);
+    g_tooltip = TooltipInfo();
+    RenderScene(hwnd);
+    InvalidateRect(hwnd, nullptr, FALSE);
     return true;
+}
+
+void OpenSelectedFont(HWND hwnd)
+{
+    if (!g_fontList) return;
+
+    const int selected = static_cast<int>(SendMessageW(g_fontList, LB_GETCURSEL, 0, 0));
+    if (selected == LB_ERR || selected >= static_cast<int>(g_fontFiles.size())) return;
+
+    LoadFont(hwnd, g_fontFiles[static_cast<size_t>(selected)].path);
+}
+
+bool SelectFontDirectory(HWND hwnd)
+{
+    IFileDialog* dialog = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_FileOpenDialog, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&dialog));
+    if (FAILED(hr)) {
+        MessageBoxW(hwnd, L"Could not open the directory selector.", L"font1", MB_ICONERROR | MB_OK);
+        return false;
+    }
+
+    DWORD options = 0;
+    if (SUCCEEDED(dialog->GetOptions(&options))) {
+        dialog->SetOptions(options | FOS_PICKFOLDERS | FOS_FORCEFILESYSTEM | FOS_PATHMUSTEXIST);
+    }
+    dialog->SetTitle(L"Select font directory");
+
+    IShellItem* initialFolder = nullptr;
+    if (SUCCEEDED(SHCreateItemFromParsingName(g_fontDirectory.c_str(), nullptr, IID_PPV_ARGS(&initialFolder)))) {
+        dialog->SetFolder(initialFolder);
+        initialFolder->Release();
+    }
+
+    bool selected = false;
+    if (SUCCEEDED(dialog->Show(hwnd))) {
+        IShellItem* result = nullptr;
+        if (SUCCEEDED(dialog->GetResult(&result))) {
+            PWSTR path = nullptr;
+            if (SUCCEEDED(result->GetDisplayName(SIGDN_FILESYSPATH, &path))) {
+                g_fontDirectory = path;
+                CoTaskMemFree(path);
+                PopulateFontList();
+                selected = true;
+            }
+            result->Release();
+        }
+    }
+
+    dialog->Release();
+    return selected;
 }
 
 bool SaveBmp(const char* path, const font::Image& image)
@@ -424,6 +670,13 @@ void PaintImage(HWND hwnd)
     PAINTSTRUCT ps{};
     HDC hdc = BeginPaint(hwnd, &ps);
 
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    RECT sidebar{ 0, 0, std::min(kSidebarWidth, static_cast<int>(rc.right - rc.left)), rc.bottom };
+    FillRect(hdc, &sidebar, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+    RECT separator{ kSidebarWidth - 1, 0, kSidebarWidth, rc.bottom };
+    FillRect(hdc, &separator, reinterpret_cast<HBRUSH>(COLOR_3DSHADOW + 1));
+
     BITMAPINFO bmi{};
     bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
     bmi.bmiHeader.biWidth = g_image.width;
@@ -434,7 +687,7 @@ void PaintImage(HWND hwnd)
 
     StretchDIBits(
         hdc,
-        0,
+        kSidebarWidth,
         0,
         g_image.width,
         g_image.height,
@@ -454,12 +707,86 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
     switch (msg) {
     case WM_CREATE:
-        if (LoadFont(hwnd)) {
-            RenderScene(hwnd);
-        }
+        g_fontCategoryCombo = CreateWindowExW(
+            0,
+            L"COMBOBOX",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | CBS_DROPDOWNLIST | WS_VSCROLL,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontCategoryId)),
+            nullptr,
+            nullptr);
+        SendMessageW(g_fontCategoryCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"TrueType fonts (.ttf)"));
+        SendMessageW(g_fontCategoryCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"TrueType collections (.ttc)"));
+        SendMessageW(g_fontCategoryCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"OpenType fonts (.otf)"));
+        SendMessageW(g_fontCategoryCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"FON fonts (.fon)"));
+        SendMessageW(g_fontCategoryCombo, CB_ADDSTRING, 0, reinterpret_cast<LPARAM>(L"FNT fonts (.fnt)"));
+        SendMessageW(g_fontCategoryCombo, CB_SETCURSEL, 0, 0);
+
+        g_fontDirectoryLabel = CreateWindowExW(
+            0,
+            L"STATIC",
+            g_fontDirectory.c_str(),
+            WS_CHILD | WS_VISIBLE | SS_NOTIFY | SS_LEFTNOWORDWRAP,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontDirectoryLabelId)),
+            nullptr,
+            nullptr);
+        g_fontList = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"LISTBOX",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | WS_VSCROLL | LBS_NOTIFY | LBS_NOINTEGRALHEIGHT,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontListId)),
+            nullptr,
+            nullptr);
+        g_fontPathEdit = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"EDIT",
+            nullptr,
+            WS_CHILD | WS_VISIBLE | ES_READONLY | ES_AUTOHSCROLL,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontPathId)),
+            nullptr,
+            nullptr);
+        g_fontOpenButton = CreateWindowExW(
+            0,
+            L"BUTTON",
+            L"Open",
+            WS_CHILD | WS_VISIBLE | BS_DEFPUSHBUTTON,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontOpenId)),
+            nullptr,
+            nullptr);
+
+        PopulateFontList();
+        LayoutMainWindow(hwnd);
+        RenderBlank(hwnd);
         return 0;
     case WM_SIZE:
-        if (g_renderer && !g_inSizeMove) {
+        LayoutMainWindow(hwnd);
+        if (!g_inSizeMove) {
             SetTimer(hwnd, kResizeTimer, kResizeDebounceMs, nullptr);
         }
         return 0;
@@ -469,10 +796,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         return 0;
     case WM_EXITSIZEMOVE:
         g_inSizeMove = false;
-        if (g_renderer) {
-            RenderScene(hwnd);
-            InvalidateRect(hwnd, nullptr, FALSE);
-        }
+        RenderScene(hwnd);
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     case WM_MOUSEMOVE:
         if (g_renderer) {
@@ -487,9 +812,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
             RECT rc{};
             GetClientRect(hwnd, &rc);
-            const int mouseX = GET_X_LPARAM(lParam);
+            const int mouseX = GET_X_LPARAM(lParam) - kSidebarWidth;
             const int mouseY = GET_Y_LPARAM(lParam);
-            TooltipInfo next = HitTestInspector(mouseX, mouseY, rc.right - rc.left, rc.bottom - rc.top);
+            const int canvasWidth = std::max(1, static_cast<int>(rc.right - rc.left) - kSidebarWidth);
+            TooltipInfo next = mouseX >= 0 ? HitTestInspector(mouseX, mouseY, canvasWidth, static_cast<int>(rc.bottom - rc.top)) : TooltipInfo();
             if (!SameTooltip(g_tooltip, next)) {
                 g_tooltip = next;
                 RenderScene(hwnd);
@@ -508,10 +834,48 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_TIMER:
         if (wParam == kResizeTimer) {
             KillTimer(hwnd, kResizeTimer);
-            if (g_renderer) {
-                RenderScene(hwnd);
-                InvalidateRect(hwnd, nullptr, FALSE);
+            RenderScene(hwnd);
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
+        }
+        return DefWindowProcW(hwnd, msg, wParam, lParam);
+    case WM_COMMAND:
+        if (LOWORD(wParam) == kFontDirectoryLabelId && HIWORD(wParam) == STN_CLICKED) {
+            SelectFontDirectory(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == kFontCategoryId && HIWORD(wParam) == CBN_SELCHANGE) {
+            const int selected = static_cast<int>(SendMessageW(g_fontCategoryCombo, CB_GETCURSEL, 0, 0));
+            switch (selected) {
+            case 1:
+                g_fontCategory = FontCategory::Ttc;
+                break;
+            case 2:
+                g_fontCategory = FontCategory::Otf;
+                break;
+            case 3:
+                g_fontCategory = FontCategory::Fon;
+                break;
+            case 4:
+                g_fontCategory = FontCategory::Fnt;
+                break;
+            default:
+                g_fontCategory = FontCategory::Ttf;
+                break;
             }
+            PopulateFontList();
+            return 0;
+        }
+        if (LOWORD(wParam) == kFontListId && HIWORD(wParam) == LBN_SELCHANGE) {
+            UpdateSelectedFontPath();
+            return 0;
+        }
+        if (LOWORD(wParam) == kFontListId && HIWORD(wParam) == LBN_DBLCLK) {
+            OpenSelectedFont(hwnd);
+            return 0;
+        }
+        if (LOWORD(wParam) == kFontOpenId) {
+            OpenSelectedFont(hwnd);
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -534,6 +898,9 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         return RunSmoke();
     }
 
+    const HRESULT comInit = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+    const bool shouldUninitializeCom = SUCCEEDED(comInit);
+
     WNDCLASSW wc{};
     wc.lpfnWndProc = WindowProc;
     wc.hInstance = instance;
@@ -541,7 +908,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
 
-    if (!RegisterClassW(&wc)) return 1;
+    if (!RegisterClassW(&wc)) {
+        if (shouldUninitializeCom) CoUninitialize();
+        return 1;
+    }
 
     HWND hwnd = CreateWindowExW(
         0,
@@ -557,7 +927,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         instance,
         nullptr);
 
-    if (!hwnd) return 1;
+    if (!hwnd) {
+        if (shouldUninitializeCom) CoUninitialize();
+        return 1;
+    }
 
     ShowWindow(hwnd, showCommand);
     UpdateWindow(hwnd);
@@ -568,5 +941,6 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         DispatchMessageW(&msg);
     }
 
+    if (shouldUninitializeCom) CoUninitialize();
     return static_cast<int>(msg.wParam);
 }
