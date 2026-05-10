@@ -27,6 +27,9 @@ constexpr int kFontDirectoryLabelId = 2000;
 constexpr int kFontListId = 2001;
 constexpr int kFontPathId = 2002;
 constexpr int kFontOpenId = 2003;
+constexpr int kLoadingLabelId = 2004;
+constexpr int kInspectorLeft = 860;
+constexpr int kInspectorWidth = 406;
 
 enum class FontCategory {
     Ttf,
@@ -52,6 +55,8 @@ HWND g_fontDirectoryLabel = nullptr;
 HWND g_fontList = nullptr;
 HWND g_fontPathEdit = nullptr;
 HWND g_fontOpenButton = nullptr;
+HWND g_loadingLabel = nullptr;
+WNDPROC g_fontListProc = nullptr;
 std::vector<FontFileItem> g_fontFiles;
 FontCategory g_fontCategory = FontCategory::Ttf;
 bool g_inSizeMove = false;
@@ -145,6 +150,16 @@ struct AuxLine {
     std::wstring name;
     std::wstring meaning;
 };
+
+RECT FixedInspectorRect(int width, int height)
+{
+    RECT rect{};
+    rect.left = kInspectorLeft;
+    rect.top = 24;
+    rect.right = std::min(width - 24, static_cast<int>(rect.left) + kInspectorWidth);
+    rect.bottom = height - 24;
+    return rect;
+}
 
 InspectorLayout BuildInspectorLayout(int left, int top, int right, int bottom)
 {
@@ -254,11 +269,11 @@ bool PointInsideGlyph(const InspectorLayout& l, double x, double y)
     return inside;
 }
 
-void DrawGlyphGrid(font::Image& image, const font::FontRenderer& renderer, int left, int top)
+void DrawGlyphGrid(font::Image& image, const font::FontRenderer& renderer, int left, int top, int rightLimit)
 {
     constexpr int cellW = 48;
     constexpr int cellH = 54;
-    constexpr int cols = 16;
+    const int cols = std::max(1, std::min(16, (rightLimit - left) / cellW));
     const wchar_t chars[] = L"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
     for (int i = 0; chars[i] != 0; ++i) {
@@ -270,6 +285,16 @@ void DrawGlyphGrid(font::Image& image, const font::FontRenderer& renderer, int l
         const uint16_t glyph = g_font.GlyphIndexForCodepoint(chars[i]);
         renderer.DrawGlyph(image, glyph, x + 10.0, y + 39.0, 32.0, 0xFF1F2630);
     }
+}
+
+double TextAdvanceUnits(const std::wstring& text)
+{
+    double advance = 0.0;
+    const std::vector<font::PositionedGlyph> glyphs = g_font.ShapeText(text);
+    for (const font::PositionedGlyph& glyph : glyphs) {
+        advance += glyph.xAdvance;
+    }
+    return advance;
 }
 
 void DrawLargeAInspector(font::Image& image, int left, int top, int right, int bottom)
@@ -291,8 +316,18 @@ void DrawLargeAInspector(font::Image& image, int left, int top, int right, int b
 
     const uint16_t glyphB = g_font.GlyphIndexForCodepoint(L'B');
     g_renderer->DrawGlyph(image, glyphB, layout.originX + layout.outline.advanceWidth * layout.scale, layout.baselineY, layout.pixelSize, 0xFF9CA3AF);
-    const double secondRowGap = (g_font.Ascender() - g_font.Descender() + g_font.LineGap()) * layout.scale;
-    g_renderer->DrawString(image, L"fine", layout.originX, layout.baselineY + secondRowGap, layout.pixelSize, 0xFF9CA3AF);
+
+    const std::wstring sample = L"fine";
+    const double sampleAdvance = std::max(1.0, TextAdvanceUnits(sample));
+    const double maxSampleWidth = std::max(1.0, right - layout.originX - 24.0);
+    const double widthFitPixelSize = maxSampleWidth * g_font.UnitsPerEm() / sampleAdvance;
+    const double heightFitPixelSize = std::max(12.0, (bottom - top) * 0.24);
+    const double samplePixelSize = std::min({ layout.pixelSize * 0.42, widthFitPixelSize, heightFitPixelSize });
+    const double sampleScale = samplePixelSize / g_font.UnitsPerEm();
+    const double desiredBaseline = layout.baselineY + (g_font.Ascender() - g_font.Descender() + g_font.LineGap()) * layout.scale;
+    const double maxBaseline = bottom - 24.0 + g_font.Descender() * sampleScale;
+    const double sampleBaseline = std::min(desiredBaseline, maxBaseline);
+    g_renderer->DrawString(image, sample, layout.originX, sampleBaseline, samplePixelSize, 0xFF9CA3AF);
 
     for (const AuxLine& line : lines) {
         DrawLine(image, line.x0, line.y0, line.x1, line.y1, line.color);
@@ -325,8 +360,8 @@ TooltipInfo HitTestInspector(int mouseX, int mouseY, int width, int height)
     info.x = mouseX;
     info.y = mouseY;
 
-    const int inspectorLeft = std::max(650, width - 430);
-    const InspectorLayout layout = BuildInspectorLayout(inspectorLeft, 24, width - 24, height - 24);
+    const RECT inspector = FixedInspectorRect(width, height);
+    const InspectorLayout layout = BuildInspectorLayout(inspector.left, inspector.top, inspector.right, inspector.bottom);
     if (!layout.valid) return info;
 
     constexpr double hitRadius = 5.0;
@@ -361,17 +396,19 @@ void RenderContent(int width, int height)
     g_image.Resize(width, height);
     g_image.Clear(0xFFE7E2D8);
 
-    DrawRect(g_image, 24, 24, width - 24, 158, 0xFFF8F7F2);
+    const RECT inspector = FixedInspectorRect(width, height);
+    const int contentRight = inspector.right - inspector.left >= 160 ? static_cast<int>(inspector.left) - 24 : width - 24;
+
+    DrawRect(g_image, 24, 24, contentRight, 158, 0xFFF8F7F2);
     const std::wstring familyName = g_font.FamilyName().empty() ? L"Selected Font" : g_font.FamilyName();
     g_renderer->DrawString(g_image, familyName, 48.0, 91.0, 54.0, 0xFF111827);
     g_renderer->DrawString(g_image, L"Custom TrueType parser + software rasterizer", 50.0, 132.0, 20.0, 0xFF46515F);
 
     g_renderer->DrawString(g_image, L"The quick brown fox jumps over the lazy dog.", 48.0, 230.0, 42.0, 0xFF111827);
     g_renderer->DrawString(g_image, L"0123456789  !?&$%@#  ABC xyz", 48.0, 290.0, 38.0, 0xFF1F2630);
-    DrawGlyphGrid(g_image, *g_renderer, 48, 340);
+    DrawGlyphGrid(g_image, *g_renderer, 48, 340, contentRight);
 
-    const int inspectorLeft = std::max(650, width - 430);
-    DrawLargeAInspector(g_image, inspectorLeft, 24, width - 24, height - 24);
+    DrawLargeAInspector(g_image, inspector.left, inspector.top, inspector.right, inspector.bottom);
     DrawTooltip(g_image);
 }
 
@@ -402,6 +439,20 @@ void RenderScene(HWND hwnd)
     std::wstring title = L"font1 - ";
     title += g_status;
     SetWindowTextW(hwnd, title.c_str());
+}
+
+RECT CanvasRect(HWND hwnd)
+{
+    RECT rc{};
+    GetClientRect(hwnd, &rc);
+    rc.left = std::min(kSidebarWidth - 1, static_cast<int>(rc.right));
+    return rc;
+}
+
+void InvalidateCanvas(HWND hwnd)
+{
+    RECT canvas = CanvasRect(hwnd);
+    InvalidateRect(hwnd, &canvas, FALSE);
 }
 
 std::wstring FileNameFromPath(const std::wstring& path)
@@ -501,6 +552,9 @@ void LayoutMainWindow(HWND hwnd)
     if (g_fontOpenButton) {
         MoveWindow(g_fontOpenButton, pad, height - pad - buttonH, kSidebarWidth - pad * 2, buttonH, TRUE);
     }
+    if (g_loadingLabel) {
+        MoveWindow(g_loadingLabel, kSidebarWidth + 48, 28, 360, 32, TRUE);
+    }
 }
 
 void UpdateSelectedFontPath();
@@ -543,12 +597,39 @@ void UpdateSelectedFontPath()
     SetWindowTextW(g_fontPathEdit, g_fontFiles[static_cast<size_t>(selected)].path.c_str());
 }
 
+void ShowLoadingPrompt(HWND hwnd, const std::wstring& path)
+{
+    if (!g_loadingLabel) return;
+
+    std::wstring text = L"Loading ";
+    text += FileNameFromPath(path);
+    text += L"...";
+    SetWindowTextW(g_loadingLabel, text.c_str());
+    ShowWindow(g_loadingLabel, SW_SHOW);
+    BringWindowToTop(g_loadingLabel);
+    SetWindowTextW(hwnd, text.c_str());
+    SetCursor(LoadCursor(nullptr, IDC_WAIT));
+    UpdateWindow(g_loadingLabel);
+}
+
+void HideLoadingPrompt(HWND hwnd)
+{
+    if (g_loadingLabel) {
+        ShowWindow(g_loadingLabel, SW_HIDE);
+    }
+    SetCursor(LoadCursor(nullptr, IDC_ARROW));
+    InvalidateCanvas(hwnd);
+}
+
 bool LoadFont(HWND hwnd, const std::wstring& path)
 {
+    ShowLoadingPrompt(hwnd, path);
+
     font::TtfFont nextFont;
     std::wstring error;
     if (!nextFont.LoadFromFile(path, &error)) {
         g_status = L"failed to load " + path + L": " + error;
+        HideLoadingPrompt(hwnd);
         MessageBoxW(hwnd, g_status.c_str(), L"font1", MB_ICONERROR | MB_OK);
         return false;
     }
@@ -558,8 +639,9 @@ bool LoadFont(HWND hwnd, const std::wstring& path)
     g_status = L"loaded " + FileNameFromPath(path);
     g_renderer = std::make_unique<font::FontRenderer>(g_font);
     g_tooltip = TooltipInfo();
+    HideLoadingPrompt(hwnd);
     RenderScene(hwnd);
-    InvalidateRect(hwnd, nullptr, FALSE);
+    InvalidateCanvas(hwnd);
     return true;
 }
 
@@ -571,6 +653,16 @@ void OpenSelectedFont(HWND hwnd)
     if (selected == LB_ERR || selected >= static_cast<int>(g_fontFiles.size())) return;
 
     LoadFont(hwnd, g_fontFiles[static_cast<size_t>(selected)].path);
+}
+
+LRESULT CALLBACK FontListProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+    if (msg == WM_KEYDOWN && wParam == VK_RETURN) {
+        OpenSelectedFont(GetParent(hwnd));
+        return 0;
+    }
+
+    return CallWindowProcW(g_fontListProc, hwnd, msg, wParam, lParam);
 }
 
 bool SelectFontDirectory(HWND hwnd)
@@ -654,7 +746,7 @@ int RunSmoke()
     std::wstring error;
     if (!g_font.LoadFromFile(kFontPath, &error)) return 2;
     g_renderer = std::make_unique<font::FontRenderer>(g_font);
-    RenderContent(900, 620);
+    RenderContent(1520, 900);
 
     size_t ink = 0;
     for (uint32_t pixel : g_image.pixels) {
@@ -672,8 +764,6 @@ void PaintImage(HWND hwnd)
 
     RECT rc{};
     GetClientRect(hwnd, &rc);
-    RECT sidebar{ 0, 0, std::min(kSidebarWidth, static_cast<int>(rc.right - rc.left)), rc.bottom };
-    FillRect(hdc, &sidebar, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
     RECT separator{ kSidebarWidth - 1, 0, kSidebarWidth, rc.bottom };
     FillRect(hdc, &separator, reinterpret_cast<HBRUSH>(COLOR_3DSHADOW + 1));
 
@@ -753,6 +843,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontListId)),
             nullptr,
             nullptr);
+        g_fontListProc = reinterpret_cast<WNDPROC>(SetWindowLongPtrW(g_fontList, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(FontListProc)));
         g_fontPathEdit = CreateWindowExW(
             WS_EX_CLIENTEDGE,
             L"EDIT",
@@ -779,6 +870,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             reinterpret_cast<HMENU>(static_cast<INT_PTR>(kFontOpenId)),
             nullptr,
             nullptr);
+        g_loadingLabel = CreateWindowExW(
+            WS_EX_CLIENTEDGE,
+            L"STATIC",
+            L"",
+            WS_CHILD | SS_CENTER | SS_CENTERIMAGE,
+            0,
+            0,
+            0,
+            0,
+            hwnd,
+            reinterpret_cast<HMENU>(static_cast<INT_PTR>(kLoadingLabelId)),
+            nullptr,
+            nullptr);
 
         PopulateFontList();
         LayoutMainWindow(hwnd);
@@ -797,7 +901,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
     case WM_EXITSIZEMOVE:
         g_inSizeMove = false;
         RenderScene(hwnd);
-        InvalidateRect(hwnd, nullptr, FALSE);
+        InvalidateCanvas(hwnd);
         return 0;
     case WM_MOUSEMOVE:
         if (g_renderer) {
@@ -819,7 +923,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             if (!SameTooltip(g_tooltip, next)) {
                 g_tooltip = next;
                 RenderScene(hwnd);
-                InvalidateRect(hwnd, nullptr, FALSE);
+                InvalidateCanvas(hwnd);
             }
         }
         return 0;
@@ -828,14 +932,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         if (g_tooltip.visible) {
             g_tooltip = TooltipInfo();
             RenderScene(hwnd);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            InvalidateCanvas(hwnd);
         }
         return 0;
     case WM_TIMER:
         if (wParam == kResizeTimer) {
             KillTimer(hwnd, kResizeTimer);
             RenderScene(hwnd);
-            InvalidateRect(hwnd, nullptr, FALSE);
+            InvalidateCanvas(hwnd);
             return 0;
         }
         return DefWindowProcW(hwnd, msg, wParam, lParam);
@@ -920,8 +1024,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand)
         WS_OVERLAPPEDWINDOW,
         CW_USEDEFAULT,
         CW_USEDEFAULT,
-        1100,
-        760,
+        1800,
+        900,
         nullptr,
         nullptr,
         instance,

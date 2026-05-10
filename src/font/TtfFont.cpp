@@ -195,7 +195,7 @@ bool TtfFont::ParseName()
         const uint32_t text = base + stringOffset + offset;
         if (!HasBytes(text, length)) continue;
 
-        if (platform == 3) {
+        if (platform == 0 || platform == 3) {
             std::wstring value;
             for (uint16_t j = 0; j + 1 < length; j += 2) value.push_back(static_cast<wchar_t>(U16(text + j)));
             familyName_ = value;
@@ -357,6 +357,7 @@ void TtfFont::ParseGsubLigatureSubtable(uint32_t subtable)
 
             const uint16_t ligatureGlyph = U16(record);
             const uint16_t componentCount = U16(record + 2);
+            if (ligatureGlyph == 0) continue;
             if (componentCount < 2 || !HasBytes(record + 4, static_cast<uint32_t>(componentCount - 1) * 2)) continue;
 
             LigatureSubstitution subst;

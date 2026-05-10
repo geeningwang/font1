@@ -14,6 +14,12 @@ struct Edge {
     double y1 = 0.0;
     double yMin = 0.0;
     double yMax = 0.0;
+    int winding = 0;
+};
+
+struct Intersection {
+    double x = 0.0;
+    int winding = 0;
 };
 
 void AccumulateSpan(std::vector<double>& coverage, int width, int row, double left, double right, int verticalSamples)
@@ -168,6 +174,7 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
             edge.y1 = b.y;
             edge.yMin = std::min(a.y, b.y);
             edge.yMax = std::max(a.y, b.y);
+            edge.winding = b.y > a.y ? 1 : -1;
             edges.push_back(edge);
         }
     }
@@ -184,7 +191,7 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
 
     constexpr int verticalSamples = 8;
     std::vector<double> coverage(static_cast<size_t>(cached.width) * cached.height, 0.0);
-    std::vector<double> intersections;
+    std::vector<Intersection> intersections;
     intersections.reserve(edges.size());
 
     for (int localY = 0; localY < cached.height; ++localY) {
@@ -195,21 +202,27 @@ const FontRenderer::CachedGlyph& FontRenderer::RasterizeGlyph(uint16_t glyphInde
             for (const Edge& edge : edges) {
                 if (sampleY >= edge.yMin && sampleY < edge.yMax) {
                     const double t = (sampleY - edge.y0) / (edge.y1 - edge.y0);
-                    intersections.push_back(edge.x0 + t * (edge.x1 - edge.x0));
+                    intersections.push_back({ edge.x0 + t * (edge.x1 - edge.x0), edge.winding });
                 }
             }
 
             if (intersections.size() < 2) continue;
-            std::sort(intersections.begin(), intersections.end());
+            std::sort(intersections.begin(), intersections.end(), [](const Intersection& a, const Intersection& b) {
+                return a.x < b.x;
+            });
 
-            for (size_t i = 0; i + 1 < intersections.size(); i += 2) {
-                AccumulateSpan(
-                    coverage,
-                    cached.width,
-                    localY,
-                    intersections[i] - x0,
-                    intersections[i + 1] - x0,
-                    verticalSamples);
+            int winding = 0;
+            for (size_t i = 0; i + 1 < intersections.size(); ++i) {
+                winding += intersections[i].winding;
+                if (winding != 0) {
+                    AccumulateSpan(
+                        coverage,
+                        cached.width,
+                        localY,
+                        intersections[i].x - x0,
+                        intersections[i + 1].x - x0,
+                        verticalSamples);
+                }
             }
         }
     }
